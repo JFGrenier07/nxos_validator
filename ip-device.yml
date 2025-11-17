@@ -1,0 +1,13 @@
+---
+# Configuration file for Nexus devices
+# Add your devices with IP and hostname
+
+devices:
+  - ip: 192.168.0.240
+    hostname: spine1
+
+  - ip: 192.168.0.241
+    hostname: leaf1
+
+  - ip: 192.168.0.242
+    hostname: leaf2
