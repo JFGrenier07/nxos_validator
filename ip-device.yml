@@ -2,6 +2,10 @@
 # Configuration file for Nexus devices
 # Add your devices with IP and hostname
 
+# SSH Credentials
+username: admin
+password: admin
+
 devices:
   - ip: 192.168.0.240
     hostname: spine1

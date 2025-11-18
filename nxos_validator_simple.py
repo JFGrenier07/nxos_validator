@@ -30,7 +30,6 @@ COMMANDS = [
     "show version",
     "show interface status",
     "show ip bgp summary vrf all",
-    "show bgp sessions vrf all",
     "show ip ospf neighbors vrf all",
     "show cdp neighbors",
     "show lldp neighbors",
@@ -303,13 +302,6 @@ class NXOSValidator:
             issues.extend(bgp_issues)
             f.write("\n")
 
-            # BGP Sessions
-            f.write("BGP SESSIONS:\n")
-            f.write("-"*80 + "\n")
-            bgp_session_issues = self.compare_bgp_sessions(pre_data, post_data, f)
-            issues.extend(bgp_session_issues)
-            f.write("\n")
-
             # OSPF
             f.write("OSPF NEIGHBORS:\n")
             f.write("-"*80 + "\n")
@@ -365,7 +357,6 @@ class NXOSValidator:
             'version': '',
             'interfaces': {},
             'bgp': {},
-            'bgp_sessions': {},
             'ospf': {},
             'cdp': [],
             'lldp': [],
@@ -413,11 +404,12 @@ class NXOSValidator:
 
         elif 'show interface status' in command:
             # Parse interfaces - capture status and vlan
+            # Format: Port Name Status Vlan Duplex Speed Type
             for line in output.split('\n'):
                 parts = line.split()
                 if len(parts) >= 3 and (parts[0].startswith('Eth') or parts[0].startswith('Vlan') or parts[0].startswith('Lo') or parts[0].startswith('mgmt')):
                     data['interfaces'][parts[0]] = {
-                        'vlan': parts[1] if len(parts) > 1 else '--',
+                        'vlan': parts[3] if len(parts) > 3 else '--',  # Fixed: VLAN is at index 3
                         'status': parts[2] if len(parts) > 2 else 'unknown'
                     }
 
@@ -436,26 +428,6 @@ class NXOSValidator:
                         data['bgp'][current_vrf].append({
                             'neighbor': parts[0],
                             'state': parts[-1]
-                        })
-
-        elif 'show bgp sessions vrf all' in command:
-            # Parse BGP sessions - extract VRF, neighbor, state, and flaps
-            current_vrf = None
-            for line in output.split('\n'):
-                if 'VRF' in line and 'local ASN' in line:
-                    match = re.search(r'VRF\s+(\S+)', line)
-                    if match:
-                        current_vrf = match.group(1).strip(',')
-                        data['bgp_sessions'][current_vrf] = []
-                elif current_vrf and re.match(r'^\d+\.\d+\.\d+\.\d+', line.strip()):
-                    # Parse neighbor line: "10.255.1.1      65000 2     02:31:49|00:00:48|00:00:48 E   179/50468      1/1"
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        data['bgp_sessions'][current_vrf].append({
-                            'neighbor': parts[0],
-                            'asn': parts[1],
-                            'flaps': parts[2],
-                            'state': parts[4]
                         })
 
         elif 'show ip ospf neighbors vrf all' in command:
@@ -545,12 +517,14 @@ class NXOSValidator:
                         data['routes'][current_vrf].append(match.group(1))
 
     def compare_interfaces(self, pre, post, f):
-        """Compare interfaces - status and VLAN"""
+        """Compare interfaces - status and VLAN with ALL state changes"""
         issues = []
         pre_intf = pre.get('interfaces', {})
         post_intf = post.get('interfaces', {})
 
         down_intfs = []
+        up_intfs = []
+        status_changed = []
         vlan_changed = []
         removed_intfs = []
         added_intfs = []
@@ -579,10 +553,19 @@ class NXOSValidator:
                 post_status = post_data.get('status', 'unknown')
                 post_vlan = post_data.get('vlan', '--')
 
-            # Check if interface went DOWN
-            if 'connected' in pre_status.lower() and 'connected' not in post_status.lower():
-                down_intfs.append(f"{intf}: {pre_status} -> {post_status}")
-                issues.append(f"Interface DOWN: {intf}")
+            # Check for ANY status change
+            if pre_status != post_status:
+                # Went DOWN (connected → not connected)
+                if 'connected' in pre_status.lower() and 'connected' not in post_status.lower():
+                    down_intfs.append(f"{intf}: {pre_status} -> {post_status}")
+                    issues.append(f"Interface DOWN: {intf}")
+                # Came UP (not connected → connected)
+                elif 'connected' not in pre_status.lower() and 'connected' in post_status.lower():
+                    up_intfs.append(f"{intf}: {pre_status} -> {post_status}")
+                    # Note: UP is good news, not an issue
+                # Other status change
+                else:
+                    status_changed.append(f"{intf}: {pre_status} -> {post_status}")
 
             # Check if VLAN changed
             if pre_vlan != post_vlan:
@@ -611,135 +594,176 @@ class NXOSValidator:
             for intf in down_intfs:
                 f.write(f"    ! {intf}\n")
 
+        if up_intfs:
+            f.write(f"  INTERFACES CAME UP ({len(up_intfs)}):\n")
+            for intf in up_intfs:
+                f.write(f"    + {intf}\n")
+
+        if status_changed:
+            f.write(f"  INTERFACE STATUS CHANGED ({len(status_changed)}):\n")
+            for intf in status_changed:
+                f.write(f"    ~ {intf}\n")
+
         if vlan_changed:
             f.write(f"  INTERFACE VLAN CHANGED ({len(vlan_changed)}):\n")
             for intf in vlan_changed:
                 f.write(f"    ~ {intf}\n")
 
-        if not removed_intfs and not added_intfs and not down_intfs and not vlan_changed:
+        if not (removed_intfs or added_intfs or down_intfs or up_intfs or status_changed or vlan_changed):
             f.write("  OK: No interface changes\n")
 
         return issues
 
     def compare_bgp(self, pre, post, f):
-        """Compare BGP"""
+        """Compare BGP with state change detection"""
         issues = []
         pre_bgp = pre.get('bgp', {})
         post_bgp = post.get('bgp', {})
 
-        for vrf in set(list(pre_bgp.keys()) + list(post_bgp.keys())):
+        for vrf in sorted(set(list(pre_bgp.keys()) + list(post_bgp.keys()))):
             pre_neighbors = {n['neighbor']: n['state'] for n in pre_bgp.get(vrf, [])}
             post_neighbors = {n['neighbor']: n['state'] for n in post_bgp.get(vrf, [])}
 
+            vrf_has_issues = False
+
+            # Check for MISSING neighbors
             missing = [n for n in pre_neighbors if n not in post_neighbors]
             if missing:
                 f.write(f"  VRF {vrf} - MISSING ({len(missing)}):\n")
                 for n in missing:
                     f.write(f"    ! {n}\n")
                     issues.append(f"BGP neighbor MISSING in VRF {vrf}: {n}")
+                vrf_has_issues = True
 
-            # Check for DOWN states
+            # Check for NEW neighbors
+            new = [n for n in post_neighbors if n not in pre_neighbors]
+            if new:
+                f.write(f"  VRF {vrf} - NEW ({len(new)}):\n")
+                for n in new:
+                    f.write(f"    + {n} (state: {post_neighbors[n]})\n")
+                # New neighbors are not issues (good news)
+
+            # Check for state changes
+            state_changes = []
+            down_neighbors = []
+
             for n in pre_neighbors:
                 if n in post_neighbors:
-                    if post_neighbors[n] in ['Idle', 'Active', 'Connect']:
-                        f.write(f"  VRF {vrf} - DOWN:\n")
-                        f.write(f"    ! {n} ({post_neighbors[n]})\n")
+                    pre_state = pre_neighbors[n]
+                    post_state = post_neighbors[n]
+
+                    # State changed?
+                    if pre_state != post_state:
+                        # Check if it's a number (Established = shows prefix count)
+                        pre_is_up = pre_state.isdigit()
+                        post_is_up = post_state.isdigit()
+
+                        if pre_is_up and not post_is_up:
+                            # Went DOWN (number → Idle/Active/etc)
+                            state_changes.append(f"    ! {n}: Established ({pre_state} pfx) -> {post_state}")
+                            issues.append(f"BGP neighbor DOWN in VRF {vrf}: {n} (was Established, now {post_state})")
+                            vrf_has_issues = True
+                        elif not pre_is_up and post_is_up:
+                            # Came UP (Idle/Active → number)
+                            state_changes.append(f"    + {n}: {pre_state} -> Established ({post_state} pfx)")
+                            # UP is good news, not an issue
+                        else:
+                            # Other state change (Idle → Active, etc.)
+                            state_changes.append(f"    ~ {n}: {pre_state} -> {post_state}")
+
+                    # Check if currently DOWN (even if no change)
+                    elif post_state in ['Idle', 'Active', 'Connect']:
+                        down_neighbors.append(f"    ! {n} ({post_state})")
                         issues.append(f"BGP neighbor DOWN in VRF {vrf}: {n}")
+                        vrf_has_issues = True
+
+            if state_changes:
+                f.write(f"  VRF {vrf} - STATE CHANGES ({len(state_changes)}):\n")
+                for change in state_changes:
+                    f.write(change + "\n")
+                vrf_has_issues = True
+
+            if down_neighbors and not state_changes:
+                # Show DOWN neighbors that didn't change state
+                f.write(f"  VRF {vrf} - DOWN ({len(down_neighbors)}):\n")
+                for n in down_neighbors:
+                    f.write(n + "\n")
 
         if not issues:
             f.write("  OK: No BGP issues\n")
 
         return issues
 
-    def compare_bgp_sessions(self, pre, post, f):
-        """Compare BGP sessions - check non-Established state, flaps, missing neighbors"""
-        issues = []
-        pre_sessions = pre.get('bgp_sessions', {})
-        post_sessions = post.get('bgp_sessions', {})
-
-        # Get all VRFs from both PRE and POST
-        all_vrfs = set(list(pre_sessions.keys()) + list(post_sessions.keys()))
-
-        for vrf in sorted(all_vrfs):
-            pre_neighbors = {n['neighbor']: n for n in pre_sessions.get(vrf, [])}
-            post_neighbors = {n['neighbor']: n for n in post_sessions.get(vrf, [])}
-
-            vrf_issues = []
-
-            # Check for missing neighbors
-            missing = [n for n in pre_neighbors if n not in post_neighbors]
-            if missing:
-                for n in missing:
-                    vrf_issues.append(f"    ! Neighbor MISSING: {n}")
-                    issues.append(f"BGP session MISSING in VRF {vrf}: {n}")
-
-            # Check for non-Established sessions
-            non_established = []
-            for n, data in post_neighbors.items():
-                if data['state'] != 'E':
-                    state_name = {
-                        'I': 'Idle',
-                        'A': 'Active',
-                        'O': 'Open',
-                        'C': 'Closing',
-                        'S': 'Shutdown'
-                    }.get(data['state'], data['state'])
-                    non_established.append(f"    ! Neighbor {n}: State={state_name}")
-                    issues.append(f"BGP session NOT Established in VRF {vrf}: {n} ({state_name})")
-
-            # Check for increased flaps
-            increased_flaps = []
-            for n, pre_data in pre_neighbors.items():
-                if n in post_neighbors:
-                    post_data = post_neighbors[n]
-                    try:
-                        pre_flaps = int(pre_data['flaps'])
-                        post_flaps = int(post_data['flaps'])
-                        if post_flaps > pre_flaps:
-                            increased_flaps.append(f"    ~ Neighbor {n}: Flaps {pre_flaps} -> {post_flaps}")
-                            issues.append(f"BGP session FLAPS increased in VRF {vrf}: {n} ({pre_flaps} -> {post_flaps})")
-                    except (ValueError, KeyError):
-                        pass
-
-            # Write VRF section if there are issues
-            if vrf_issues or non_established or increased_flaps:
-                f.write(f"  VRF {vrf}:\n")
-                for issue in vrf_issues:
-                    f.write(issue + "\n")
-                for issue in non_established:
-                    f.write(issue + "\n")
-                for issue in increased_flaps:
-                    f.write(issue + "\n")
-
-        if not issues:
-            f.write("  OK: No BGP session issues\n")
-
-        return issues
-
     def compare_ospf(self, pre, post, f):
-        """Compare OSPF"""
+        """Compare OSPF with state change detection"""
         issues = []
         pre_ospf = pre.get('ospf', {})
         post_ospf = post.get('ospf', {})
 
-        for vrf in set(list(pre_ospf.keys()) + list(post_ospf.keys())):
+        for vrf in sorted(set(list(pre_ospf.keys()) + list(post_ospf.keys()))):
             pre_neighbors = {n['neighbor']: n['state'] for n in pre_ospf.get(vrf, [])}
             post_neighbors = {n['neighbor']: n['state'] for n in post_ospf.get(vrf, [])}
 
+            vrf_has_issues = False
+
+            # Check for MISSING neighbors
             missing = [n for n in pre_neighbors if n not in post_neighbors]
             if missing:
                 f.write(f"  VRF {vrf} - MISSING ({len(missing)}):\n")
                 for n in missing:
                     f.write(f"    ! {n}\n")
                     issues.append(f"OSPF neighbor MISSING in VRF {vrf}: {n}")
+                vrf_has_issues = True
 
-            # Check for non-FULL states
+            # Check for NEW neighbors
+            new = [n for n in post_neighbors if n not in pre_neighbors]
+            if new:
+                f.write(f"  VRF {vrf} - NEW ({len(new)}):\n")
+                for n in new:
+                    f.write(f"    + {n} (state: {post_neighbors[n]})\n")
+                # New neighbors are not issues
+
+            # Check for state changes
+            state_changes = []
+            not_full = []
+
             for n in pre_neighbors:
                 if n in post_neighbors:
-                    if 'FULL' not in post_neighbors[n]:
-                        f.write(f"  VRF {vrf} - NOT FULL:\n")
-                        f.write(f"    ! {n} ({post_neighbors[n]})\n")
+                    pre_state = pre_neighbors[n]
+                    post_state = post_neighbors[n]
+
+                    # State changed?
+                    if pre_state != post_state:
+                        if 'FULL' in pre_state and 'FULL' not in post_state:
+                            # Went DOWN (FULL → other)
+                            state_changes.append(f"    ! {n}: {pre_state} -> {post_state}")
+                            issues.append(f"OSPF neighbor went DOWN in VRF {vrf}: {n} ({pre_state} -> {post_state})")
+                            vrf_has_issues = True
+                        elif 'FULL' not in pre_state and 'FULL' in post_state:
+                            # Came UP (other → FULL)
+                            state_changes.append(f"    + {n}: {pre_state} -> {post_state}")
+                            # UP is good news
+                        else:
+                            # Other state change
+                            state_changes.append(f"    ~ {n}: {pre_state} -> {post_state}")
+
+                    # Check if currently NOT FULL (even if no change)
+                    elif 'FULL' not in post_state:
+                        not_full.append(f"    ! {n} ({post_state})")
                         issues.append(f"OSPF neighbor NOT FULL in VRF {vrf}: {n}")
+                        vrf_has_issues = True
+
+            if state_changes:
+                f.write(f"  VRF {vrf} - STATE CHANGES ({len(state_changes)}):\n")
+                for change in state_changes:
+                    f.write(change + "\n")
+                vrf_has_issues = True
+
+            if not_full and not state_changes:
+                # Show NOT FULL neighbors that didn't change state
+                f.write(f"  VRF {vrf} - NOT FULL ({len(not_full)}):\n")
+                for n in not_full:
+                    f.write(n + "\n")
 
         if not issues:
             f.write("  OK: No OSPF issues\n")
@@ -747,19 +771,28 @@ class NXOSValidator:
         return issues
 
     def compare_cdp_lldp(self, pre, post, f, protocol):
-        """Compare CDP/LLDP"""
+        """Compare CDP/LLDP with new neighbor detection"""
         issues = []
         pre_set = set(pre)
         post_set = set(post)
 
         missing = pre_set - post_set
+        new = post_set - pre_set
+
         if missing:
             f.write(f"  MISSING {protocol} neighbors ({len(missing)}):\n")
-            for m in missing:
+            for m in sorted(missing):
                 f.write(f"    ! {m}\n")
                 issues.append(f"{protocol} neighbor MISSING: {m}")
-        else:
-            f.write(f"  OK: No {protocol} neighbors missing\n")
+
+        if new:
+            f.write(f"  NEW {protocol} neighbors ({len(new)}):\n")
+            for n in sorted(new):
+                f.write(f"    + {n}\n")
+            # New neighbors are not issues
+
+        if not missing and not new:
+            f.write(f"  OK: No {protocol} neighbor changes\n")
 
         return issues
 
@@ -831,24 +864,20 @@ class NXOSValidator:
             f.write(f"\n  VRF {vrf}:\n")
             f.write(f"    Total routes: {pre_count} -> {post_count}\n")
 
-            # Display missing routes
+            # Display missing routes - SHOW ALL!
             if missing_routes:
                 f.write(f"    ROUTES REMOVED ({len(missing_routes)}):\n")
-                for route in sorted(missing_routes)[:20]:  # Limit to 20 for readability
+                for route in sorted(missing_routes):
                     f.write(f"      - {route}\n")
-                if len(missing_routes) > 20:
-                    f.write(f"      ... and {len(missing_routes)-20} more\n")
 
                 # Add to issues
                 issues.append(f"Routes REMOVED in VRF {vrf}: {len(missing_routes)} route(s)")
 
-            # Display added routes
+            # Display added routes - SHOW ALL!
             if added_routes:
                 f.write(f"    ROUTES ADDED ({len(added_routes)}):\n")
-                for route in sorted(added_routes)[:20]:  # Limit to 20 for readability
+                for route in sorted(added_routes):
                     f.write(f"      + {route}\n")
-                if len(added_routes) > 20:
-                    f.write(f"      ... and {len(added_routes)-20} more\n")
 
             # If no changes
             if not missing_routes and not added_routes:
