@@ -208,8 +208,9 @@ class NXOSValidator:
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
-        # Output file
-        output_file = os.path.join(output_dir, f"{hostname}.txt")
+        # Output file with timestamp
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        output_file = os.path.join(output_dir, f"{hostname}_{timestamp}.txt")
 
         total_commands = len(COMMANDS)
 
@@ -244,6 +245,26 @@ class NXOSValidator:
         print(f"[{hostname}] Data saved to {output_file}")
 
         return output_file
+
+    def get_latest_file(self, directory, hostname):
+        """Get the most recent file for a given hostname"""
+        if not os.path.exists(directory):
+            return None
+
+        # Find all files matching hostname pattern
+        pattern = f"{hostname}_*.txt"
+        files = [f for f in os.listdir(directory) if f.startswith(f"{hostname}_") and f.endswith('.txt')]
+
+        if not files:
+            # Try without timestamp (backward compatibility)
+            old_pattern = f"{hostname}.txt"
+            if os.path.exists(os.path.join(directory, old_pattern)):
+                return os.path.join(directory, old_pattern)
+            return None
+
+        # Sort by filename (timestamp is in filename) and get the latest
+        files.sort(reverse=True)
+        return os.path.join(directory, files[0])
 
     def compare_data(self, pre_file, post_file, hostname):
         """Compare PRE and POST data"""
@@ -892,9 +913,9 @@ def main():
     print("="*80)
 
     print("\nSelect mode:")
-    print("  1 - PRE-UPGRADE: Collect baseline (removes old PRE data)")
-    print("  2 - POST-UPGRADE: Collect and compare (removes old POST data)")
-    print("  3 - COMPARE ONLY: Run comparison without collecting new data")
+    print("  1 - PRE-UPGRADE: Collect baseline (keeps history with timestamp)")
+    print("  2 - POST-UPGRADE: Collect data (keeps history with timestamp)")
+    print("  3 - COMPARE ONLY: Compare files (auto or manual selection)")
 
     mode = input("\nEnter choice (1, 2, or 3): ").strip()
 
@@ -928,31 +949,146 @@ def main():
             shutil.rmtree(COMPARE_DIR)
 
         print(f"\n{'='*80}")
+        print("COMPARE MODE")
+        print(f"{'='*80}")
+
+        # Ask user if they want to compare all or select specific files
+        print("\nOptions:")
+        print("  1 - Compare ALL devices (latest files)")
+        print("  2 - Select specific files to compare")
+        compare_choice = input("\nYour choice (1/2): ").strip()
+
+        files_to_compare = []
+
+        if compare_choice == '2':
+            # MANUAL FILE SELECTION MODE
+            print(f"\n{'='*80}")
+            print("FILE SELECTION MODE")
+            print(f"{'='*80}")
+
+            # List all PRE files
+            print("\n--- Available PRE-VALIDATION files ---")
+            if not os.path.exists(PRE_DIR):
+                print("ERROR: PRE directory does not exist!")
+                sys.exit(1)
+
+            pre_files = [f for f in os.listdir(PRE_DIR) if f.endswith('.txt')]
+            pre_files.sort(reverse=True)  # Most recent first
+
+            if not pre_files:
+                print("ERROR: No PRE files found!")
+                sys.exit(1)
+
+            for idx, filename in enumerate(pre_files, 1):
+                file_path = os.path.join(PRE_DIR, filename)
+                # Get file modification time
+                mtime = os.path.getmtime(file_path)
+                timestamp = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                print(f"  {idx}. {filename} (modified: {timestamp})")
+
+            pre_selection = input(f"\nSelect PRE file (1-{len(pre_files)}): ").strip()
+            try:
+                pre_idx = int(pre_selection) - 1
+                if pre_idx < 0 or pre_idx >= len(pre_files):
+                    print("Invalid selection!")
+                    sys.exit(1)
+                selected_pre_file = os.path.join(PRE_DIR, pre_files[pre_idx])
+            except ValueError:
+                print("Invalid input!")
+                sys.exit(1)
+
+            # List all POST files
+            print("\n--- Available POST-VALIDATION files ---")
+            if not os.path.exists(POST_DIR):
+                print("ERROR: POST directory does not exist!")
+                sys.exit(1)
+
+            post_files = [f for f in os.listdir(POST_DIR) if f.endswith('.txt')]
+            post_files.sort(reverse=True)  # Most recent first
+
+            if not post_files:
+                print("ERROR: No POST files found!")
+                sys.exit(1)
+
+            for idx, filename in enumerate(post_files, 1):
+                file_path = os.path.join(POST_DIR, filename)
+                # Get file modification time
+                mtime = os.path.getmtime(file_path)
+                timestamp = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                print(f"  {idx}. {filename} (modified: {timestamp})")
+
+            post_selection = input(f"\nSelect POST file (1-{len(post_files)}): ").strip()
+            try:
+                post_idx = int(post_selection) - 1
+                if post_idx < 0 or post_idx >= len(post_files):
+                    print("Invalid selection!")
+                    sys.exit(1)
+                selected_post_file = os.path.join(POST_DIR, post_files[post_idx])
+            except ValueError:
+                print("Invalid input!")
+                sys.exit(1)
+
+            # Extract hostname from filename (hostname is before first underscore or .txt)
+            pre_basename = os.path.basename(selected_pre_file)
+            if '_' in pre_basename:
+                hostname = pre_basename.split('_')[0]
+            else:
+                hostname = pre_basename.replace('.txt', '')
+
+            files_to_compare.append({
+                'pre': selected_pre_file,
+                'post': selected_post_file,
+                'hostname': hostname
+            })
+
+            print(f"\n{'='*80}")
+            print(f"Will compare:")
+            print(f"  PRE:  {os.path.basename(selected_pre_file)}")
+            print(f"  POST: {os.path.basename(selected_post_file)}")
+            print(f"{'='*80}")
+
+        else:
+            # AUTO MODE - Compare all devices using latest files
+            print(f"\n{'='*80}")
+            print("AUTO MODE - Comparing all devices (latest files)")
+            print(f"{'='*80}")
+
+            for device in validator.devices:
+                hostname = device['hostname']
+
+                # Get the most recent PRE and POST files
+                pre_file = validator.get_latest_file(PRE_DIR, hostname)
+                post_file = validator.get_latest_file(POST_DIR, hostname)
+
+                if not pre_file:
+                    print(f"\n[{hostname}] WARNING: No PRE data found")
+                    continue
+
+                if not post_file:
+                    print(f"\n[{hostname}] WARNING: No POST data found")
+                    continue
+
+                files_to_compare.append({
+                    'pre': pre_file,
+                    'post': post_file,
+                    'hostname': hostname
+                })
+
+        # Perform comparisons
+        print(f"\n{'='*80}")
         print("Starting comparison...")
         print(f"{'='*80}")
 
-        for device in validator.devices:
-            hostname = device['hostname']
-            pre_file = os.path.join(PRE_DIR, f"{hostname}.txt")
-            post_file = os.path.join(POST_DIR, f"{hostname}.txt")
-
-            if not os.path.exists(pre_file):
-                print(f"\n[{hostname}] WARNING: No PRE data found")
-                continue
-
-            if not os.path.exists(post_file):
-                print(f"\n[{hostname}] WARNING: No POST data found")
-                continue
-
-            validator.compare_data(pre_file, post_file, hostname)
+        for item in files_to_compare:
+            validator.compare_data(item['pre'], item['post'], item['hostname'])
 
         # Display all comparison reports on screen
         print(f"\n{'='*80}")
         print("COMPARISON REPORTS")
         print(f"{'='*80}\n")
 
-        for device in validator.devices:
-            hostname = device['hostname']
+        for item in files_to_compare:
+            hostname = item['hostname']
             report_file = os.path.join(COMPARE_DIR, f"{hostname}_report.txt")
 
             if os.path.exists(report_file):
@@ -977,8 +1113,8 @@ def main():
 
     if is_pre:
         print("\n[MODE] PRE-UPGRADE")
-        if os.path.exists(PRE_DIR):
-            shutil.rmtree(PRE_DIR)
+        # Create directory if it doesn't exist (no longer deleting old data)
+        os.makedirs(PRE_DIR, exist_ok=True)
 
         for device in validator.devices:
             validator.collect_data(device, PRE_DIR)
@@ -989,8 +1125,8 @@ def main():
 
     else:
         print("\n[MODE] POST-UPGRADE")
-        if os.path.exists(POST_DIR):
-            shutil.rmtree(POST_DIR)
+        # Create directory if it doesn't exist (no longer deleting old data)
+        os.makedirs(POST_DIR, exist_ok=True)
 
         for device in validator.devices:
             validator.collect_data(device, POST_DIR)
@@ -998,54 +1134,8 @@ def main():
         print(f"\n{'='*80}")
         print(f"POST-UPGRADE data collection completed!")
         print(f"Data: {POST_DIR}/")
+        print(f"\nTo compare PRE vs POST data, run option 3 (COMPARE ONLY)")
         print(f"{'='*80}")
-
-        # Ask user if they want to run comparison
-        print("\n")
-        run_comparison = input("Voulez-vous faire la comparaison des fichiers? (oui/non): ").strip().lower()
-
-        if run_comparison in ['oui', 'o', 'yes', 'y']:
-            # Remove old comparison directory
-            if os.path.exists(COMPARE_DIR):
-                shutil.rmtree(COMPARE_DIR)
-
-            print(f"\n{'='*80}")
-            print("Starting comparison...")
-            print(f"{'='*80}")
-
-            for device in validator.devices:
-                hostname = device['hostname']
-                pre_file = os.path.join(PRE_DIR, f"{hostname}.txt")
-                post_file = os.path.join(POST_DIR, f"{hostname}.txt")
-
-                if not os.path.exists(pre_file):
-                    print(f"\n[{hostname}] WARNING: No PRE data found")
-                    continue
-
-                validator.compare_data(pre_file, post_file, hostname)
-
-            # Display all comparison reports on screen
-            print(f"\n{'='*80}")
-            print("COMPARISON REPORTS")
-            print(f"{'='*80}\n")
-
-            for device in validator.devices:
-                hostname = device['hostname']
-                report_file = os.path.join(COMPARE_DIR, f"{hostname}_report.txt")
-
-                if os.path.exists(report_file):
-                    with open(report_file, 'r') as f:
-                        report_content = f.read()
-                    print(report_content)
-                    print("\n")
-
-            print(f"{'='*80}")
-            print(f"COMPARISON completed!")
-            print(f"Reports: {COMPARE_DIR}/")
-            print(f"{'='*80}")
-        else:
-            print("\nComparison skipped. You can run comparison later using option 3.")
-            print(f"POST-UPGRADE completed!")
 
 
 if __name__ == "__main__":
